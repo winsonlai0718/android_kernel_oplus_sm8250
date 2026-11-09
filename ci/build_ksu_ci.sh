@@ -64,6 +64,13 @@ def repl(path, old, new, label, required=True):
     open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
     print("WBPATCH OK: " + label)
 
+# (0) input_boost_timeout() is defined later in kernel/sysctl.c; the fix
+#     below references it, so add a forward declaration first.
+repl("kernel/sysctl.c",
+"static ktime_t ib_last_time;\n\nvoid enable_input_boost_timer(void)",
+"static ktime_t ib_last_time;\n\n/* WB: forward declaration (definition appears later) */\nenum hrtimer_restart input_boost_timeout(struct hrtimer *timer);\n\nvoid enable_input_boost_timer(void)",
+"forward-declare-timeout")
+
 # (1) ROOT CAUSE OF THE REBOOT: input_boost_ctrl_handler() starts an
 #     hrtimer that was never initialised (function == NULL, duration == 0).
 #     Writing /proc/sys/kernel/input_boost_enabled=1 crashed the kernel.
