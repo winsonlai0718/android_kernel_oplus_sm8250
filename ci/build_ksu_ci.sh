@@ -27,7 +27,9 @@ if find $AK3_PATH -maxdepth 1 -type f -name "*.zip" | grep -q .; then
 fi
 
 # ReSukiSU
-curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash
+# WB: pin KSU to the exact commit baked into the running kernel
+# (v4.2.0-rc1-3c188288), instead of pulling today's main branch.
+curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/3c188288/kernel/setup.sh" | bash -s -- 3c188288
 
 # Modify repo name
 BASE_VER=$(grep -oE 'expr [0-9]+' "$KERNEL_ROOT/KernelSU/kernel/Kbuild" | awk '{print $2}' || echo "30000")
@@ -44,6 +46,89 @@ echo ">>> Version Code: $KSU_VERSION_CODE"
 echo ">>> Version Name: $FINAL_KSU_VER"
 
 export KSU_MAKE_ARGS="REPO_NAME=xxtvrxx233-Github_actions KSU_VERSION_FULL=$FINAL_KSU_VER KSU_COMMIT_SHA=$KSU_HASH KSU_VERSION=$KSU_VERSION_CODE"
+
+# ---- WorkBuddy touch-response source patches (applied before make) ----
+python3 - "$KERNEL_ROOT" <<'WBPATCH'
+import sys, os
+root = sys.argv[1]
+
+def repl(path, old, new, label, required=True):
+    p = os.path.join(root, path)
+    if not os.path.isfile(p):
+        if required: raise SystemExit("WBPATCH MISSING FILE: " + path)
+        print("WBPATCH SKIP (no file): " + label); return
+    s = open(p, encoding="utf-8").read()
+    if old not in s:
+        if required: raise SystemExit("WBPATCH ANCHOR NOT FOUND: " + label)
+        print("WBPATCH SKIP (no anchor): " + label); return
+    open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+    print("WBPATCH OK: " + label)
+
+# (1) ROOT CAUSE OF THE REBOOT: input_boost_ctrl_handler() starts an
+#     hrtimer that was never initialised (function == NULL, duration == 0).
+#     Writing /proc/sys/kernel/input_boost_enabled=1 crashed the kernel.
+repl("kernel/sysctl.c",
+'''	ib_last_time = ktime_get();
+	ktime = ktime_set(0, intput_boost_duration);
+
+	hrtimer_start(&ibtimer, ktime, HRTIMER_MODE_REL);''',
+'''	ib_last_time = ktime_get();
+	/* WB: lazily initialise the hrtimer. Stock code starts an
+	 * uninitialised timer here and reboots the device. */
+	if (!intput_boost_duration)
+		intput_boost_duration = INPUT_BOOST_DURATION;
+	if (!ibtimer.function) {
+		hrtimer_init(&ibtimer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+		ibtimer.function = &input_boost_timeout;
+	}
+	ktime = ktime_set(0, intput_boost_duration);
+
+	hrtimer_start(&ibtimer, ktime, HRTIMER_MODE_REL);''',
+"fix-input-boost-hrtimer")
+
+# (2) WALT: runtime writes are rejected (handler returns -EPERM),
+#     so shorten the compile-time load-tracking window to 1 tick.
+repl("kernel/sched/walt.c",
+"unsigned int sysctl_sched_ravg_window_nr_ticks = (HZ / NR_WINDOWS_PER_SEC);",
+"unsigned int sysctl_sched_ravg_window_nr_ticks = 1; /* WB: faster load detection */",
+"walt-window-1tick")
+
+# (3) sched_assist_scene stays 0 on this port (no ORMS scene published),
+#     so SA_SLIDE / SA_INPUT boost values are dead code. Add a 120Hz fallback.
+repl("include/linux/sched_assist/sched_assist_slide.c",
+'''	} else if (sched_assist_scene(SA_INPUT)) {
+		if (sysctl_frame_rate <= 90)
+			*maxtime = 8;
+		else if (sysctl_frame_rate <= 120)
+			*maxtime = 7;
+		else
+			*maxtime = 6;
+	}
+}''',
+'''	} else if (sched_assist_scene(SA_INPUT)) {
+		if (sysctl_frame_rate <= 90)
+			*maxtime = 8;
+		else if (sysctl_frame_rate <= 120)
+			*maxtime = 7;
+		else
+			*maxtime = 6;
+	} else {
+		/* WB: no ORMS scene on this port; keep the 120Hz input value */
+		*maxtime = 7;
+	}
+}''',
+"sched-assist-input-fallback", required=False)
+
+# (4) Match the real 120Hz panel and enable slide boost by default.
+#     slide_boost_enabled=1 was verified safe at runtime on the device.
+repl("kernel/sysctl.c", "int sysctl_frame_rate = 60;",
+     "int sysctl_frame_rate = 120; /* WB: panel is 120Hz */",
+     "frame-rate-120", required=False)
+repl("include/linux/sched_assist/sched_assist_slide.c",
+     "int sysctl_slide_boost_enabled = 0;",
+     "int sysctl_slide_boost_enabled = 1; /* WB: verified safe */",
+     "slide-boost-default", required=False)
+WBPATCH
 
 # ---- drivers/Kconfig ----
 echo "Injecting KSU Kconfig entry..."
